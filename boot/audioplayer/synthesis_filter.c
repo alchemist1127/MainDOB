@@ -1,0 +1,213 @@
+/* synthesis_filter.c — Filtro di sintesi polifase MPEG-1.
+ *
+ * Implementa la catena a 5 blocchi (ISO/IEC 11172-3 Annex 3-A.2):
+ *   1. Shift FIFO V[] di 64 posizioni (via offset circolare)
+ *   2. Matricizzazione: V[i] = Σ N[i][k] * subband[k], i=0..63
+ *   3. Build vettore U[512] tramite permutazione di V[]
+ *   4. Finestratura: W[i] = U[i] * D[i]
+ *   5. Collasso: PCM[j] = Σ W[32i+j] per i=0..15
+ *
+ * La matrice N[64][32] e la finestra prototipo D[512] sono precomputate
+ * una volta in synfilt_init.
+ */
+
+#include "synthesis_filter.h"
+#include "math_helpers.h"
+
+/* Tabelle globali (computed at init) */
+
+static int16_t N_matrix[64][32];  /* N[i][k] = 256*cos((16+i)(2k+1)π/64), Q8 */
+static int32_t D_window[512];     /* Finestra prototipo MPEG-1, Q16 (ISO Table B.3) */
+static int     initialized = 0;
+
+/* ISO 11172-3 Annex 3-B Table B.3 (synthesis window D[512]).
+ * Valori da kjmp2 in Q16.16 fixed-point; usati direttamente nel pipeline
+ * integer (V Q9 × D Q16 → prod Q25, shift 6 → Q19, sum, shift 4 → int16).
+ */
+static const int32_t D_iso_q16[512] =
+{
+     0x00000,  0x00000,  0x00000,  0x00000,  0x00000,  0x00000,  0x00000, -0x00001,
+    -0x00001, -0x00001, -0x00001, -0x00002, -0x00002, -0x00003, -0x00003, -0x00004,
+    -0x00004, -0x00005, -0x00006, -0x00006, -0x00007, -0x00008, -0x00009, -0x0000A,
+    -0x0000C, -0x0000D, -0x0000F, -0x00010, -0x00012, -0x00014, -0x00017, -0x00019,
+    -0x0001C, -0x0001E, -0x00022, -0x00025, -0x00028, -0x0002C, -0x00030, -0x00034,
+    -0x00039, -0x0003E, -0x00043, -0x00048, -0x0004E, -0x00054, -0x0005A, -0x00060,
+    -0x00067, -0x0006E, -0x00074, -0x0007C, -0x00083, -0x0008A, -0x00092, -0x00099,
+    -0x000A0, -0x000A8, -0x000AF, -0x000B6, -0x000BD, -0x000C3, -0x000C9, -0x000CF,
+     0x000D5,  0x000DA,  0x000DE,  0x000E1,  0x000E3,  0x000E4,  0x000E4,  0x000E3,
+     0x000E0,  0x000DD,  0x000D7,  0x000D0,  0x000C8,  0x000BD,  0x000B1,  0x000A3,
+     0x00092,  0x0007F,  0x0006A,  0x00053,  0x00039,  0x0001D, -0x00001, -0x00023,
+    -0x00047, -0x0006E, -0x00098, -0x000C4, -0x000F3, -0x00125, -0x0015A, -0x00190,
+    -0x001CA, -0x00206, -0x00244, -0x00284, -0x002C6, -0x0030A, -0x0034F, -0x00396,
+    -0x003DE, -0x00427, -0x00470, -0x004B9, -0x00502, -0x0054B, -0x00593, -0x005D9,
+    -0x0061E, -0x00661, -0x006A1, -0x006DE, -0x00718, -0x0074D, -0x0077E, -0x007A9,
+    -0x007D0, -0x007EF, -0x00808, -0x0081A, -0x00824, -0x00826, -0x0081F, -0x0080E,
+     0x007F5,  0x007D0,  0x007A0,  0x00765,  0x0071E,  0x006CB,  0x0066C,  0x005FF,
+     0x00586,  0x00500,  0x0046B,  0x003CA,  0x0031A,  0x0025D,  0x00192,  0x000B9,
+    -0x0002C, -0x0011F, -0x00220, -0x0032D, -0x00446, -0x0056B, -0x0069B, -0x007D5,
+    -0x00919, -0x00A66, -0x00BBB, -0x00D16, -0x00E78, -0x00FDE, -0x01148, -0x012B3,
+    -0x01420, -0x0158C, -0x016F6, -0x0185C, -0x019BC, -0x01B16, -0x01C66, -0x01DAC,
+    -0x01EE5, -0x02010, -0x0212A, -0x02232, -0x02325, -0x02402, -0x024C7, -0x02570,
+    -0x025FE, -0x0266D, -0x026BB, -0x026E6, -0x026ED, -0x026CE, -0x02686, -0x02615,
+    -0x02577, -0x024AC, -0x023B2, -0x02287, -0x0212B, -0x01F9B, -0x01DD7, -0x01BDD,
+     0x019AE,  0x01747,  0x014A8,  0x011D1,  0x00EC0,  0x00B77,  0x007F5,  0x0043A,
+     0x00046, -0x003E5, -0x00849, -0x00CE3, -0x011B4, -0x016B9, -0x01BF1, -0x0215B,
+    -0x026F6, -0x02CBE, -0x032B3, -0x038D3, -0x03F1A, -0x04586, -0x04C15, -0x052C4,
+    -0x05990, -0x06075, -0x06771, -0x06E80, -0x0759F, -0x07CCA, -0x083FE, -0x08B37,
+    -0x09270, -0x099A7, -0x0A0D7, -0x0A7FD, -0x0AF14, -0x0B618, -0x0BD05, -0x0C3D8,
+    -0x0CA8C, -0x0D11D, -0x0D789, -0x0DDC9, -0x0E3DC, -0x0E9BD, -0x0EF68, -0x0F4DB,
+    -0x0FA12, -0x0FF09, -0x103BD, -0x1082C, -0x10C53, -0x1102E, -0x113BD, -0x116FB,
+    -0x119E8, -0x11C82, -0x11EC6, -0x120B3, -0x12248, -0x12385, -0x12467, -0x124EF,
+     0x1251E,  0x124F0,  0x12468,  0x12386,  0x12249,  0x120B4,  0x11EC7,  0x11C83,
+     0x119E9,  0x116FC,  0x113BE,  0x1102F,  0x10C54,  0x1082D,  0x103BE,  0x0FF0A,
+     0x0FA13,  0x0F4DC,  0x0EF69,  0x0E9BE,  0x0E3DD,  0x0DDCA,  0x0D78A,  0x0D11E,
+     0x0CA8D,  0x0C3D9,  0x0BD06,  0x0B619,  0x0AF15,  0x0A7FE,  0x0A0D8,  0x099A8,
+     0x09271,  0x08B38,  0x083FF,  0x07CCB,  0x075A0,  0x06E81,  0x06772,  0x06076,
+     0x05991,  0x052C5,  0x04C16,  0x04587,  0x03F1B,  0x038D4,  0x032B4,  0x02CBF,
+     0x026F7,  0x0215C,  0x01BF2,  0x016BA,  0x011B5,  0x00CE4,  0x0084A,  0x003E6,
+    -0x00045, -0x00439, -0x007F4, -0x00B76, -0x00EBF, -0x011D0, -0x014A7, -0x01746,
+     0x019AE,  0x01BDE,  0x01DD8,  0x01F9C,  0x0212C,  0x02288,  0x023B3,  0x024AD,
+     0x02578,  0x02616,  0x02687,  0x026CF,  0x026EE,  0x026E7,  0x026BC,  0x0266E,
+     0x025FF,  0x02571,  0x024C8,  0x02403,  0x02326,  0x02233,  0x0212B,  0x02011,
+     0x01EE6,  0x01DAD,  0x01C67,  0x01B17,  0x019BD,  0x0185D,  0x016F7,  0x0158D,
+     0x01421,  0x012B4,  0x01149,  0x00FDF,  0x00E79,  0x00D17,  0x00BBC,  0x00A67,
+     0x0091A,  0x007D6,  0x0069C,  0x0056C,  0x00447,  0x0032E,  0x00221,  0x00120,
+     0x0002D, -0x000B8, -0x00191, -0x0025C, -0x00319, -0x003C9, -0x0046A, -0x004FF,
+    -0x00585, -0x005FE, -0x0066B, -0x006CA, -0x0071D, -0x00764, -0x0079F, -0x007CF,
+     0x007F5,  0x0080F,  0x00820,  0x00827,  0x00825,  0x0081B,  0x00809,  0x007F0,
+     0x007D1,  0x007AA,  0x0077F,  0x0074E,  0x00719,  0x006DF,  0x006A2,  0x00662,
+     0x0061F,  0x005DA,  0x00594,  0x0054C,  0x00503,  0x004BA,  0x00471,  0x00428,
+     0x003DF,  0x00397,  0x00350,  0x0030B,  0x002C7,  0x00285,  0x00245,  0x00207,
+     0x001CB,  0x00191,  0x0015B,  0x00126,  0x000F4,  0x000C5,  0x00099,  0x0006F,
+     0x00048,  0x00024,  0x00002, -0x0001C, -0x00038, -0x00052, -0x00069, -0x0007E,
+    -0x00091, -0x000A2, -0x000B0, -0x000BC, -0x000C7, -0x000CF, -0x000D6, -0x000DC,
+    -0x000DF, -0x000E2, -0x000E3, -0x000E3, -0x000E2, -0x000E0, -0x000DD, -0x000D9,
+     0x000D5,  0x000D0,  0x000CA,  0x000C4,  0x000BE,  0x000B7,  0x000B0,  0x000A9,
+     0x000A1,  0x0009A,  0x00093,  0x0008B,  0x00084,  0x0007D,  0x00075,  0x0006F,
+     0x00068,  0x00061,  0x0005B,  0x00055,  0x0004F,  0x00049,  0x00044,  0x0003F,
+     0x0003A,  0x00035,  0x00031,  0x0002D,  0x00029,  0x00026,  0x00023,  0x0001F,
+     0x0001D,  0x0001A,  0x00018,  0x00015,  0x00013,  0x00011,  0x00010,  0x0000E,
+     0x0000D,  0x0000B,  0x0000A,  0x00009,  0x00008,  0x00007,  0x00007,  0x00006,
+     0x00005,  0x00005,  0x00004,  0x00004,  0x00003,  0x00003,  0x00002,  0x00002,
+     0x00002,  0x00002,  0x00001,  0x00001,  0x00001,  0x00001,  0x00001,  0x00001
+};
+
+/*  * synfilt_init — precompute tables (tutte int)
+ *
+ * Sub-blocchi:
+ *   a) N matrix: matrice DCT-like 64×32 in Q8 (cos × 256)
+ *   b) D window: copia diretta da D_iso_q16 (già in Q16)
+ */
+
+void
+synfilt_init(void)
+{
+    if (initialized) return;
+
+    /* (a) Matrice N[64][32] in Q8 */
+    for (int i = 0; i < 64; i++)
+    {
+        for (int k = 0; k < 32; k++)
+        {
+            float angle = ((float)(16 + i) * (float)(2 * k + 1) * MH_PI) / 64.0f;
+            float c = mh_cosf(angle);
+            int v = (int)(c * 256.0f + (c >= 0.0f ? 0.5f : -0.5f));
+            if (v >  32767) v =  32767;
+            if (v < -32768) v = -32768;
+            N_matrix[i][k] = (int16_t)v;
+        }
+    }
+
+    /* (b) Finestra D[512]: copia diretta (già Q16) */
+    for (int i = 0; i < 512; i++)
+    {
+        D_window[i] = D_iso_q16[i];
+    }
+
+    initialized = 1;
+}
+
+void
+synfilt_reset(synfilt_state_t *s)
+{
+    for (int i = 0; i < 1024; i++) s->V[i] = 0;
+    s->offset = 0;
+}
+
+/*  * synfilt_process — pipeline completa subband→PCM (integer, stile kjmp2)
+ *
+ * Scaling:
+ *   subband[k] (float) → sample_int (Q15, ×32768)
+ *   N_matrix: Q8 (int16)
+ *   V: Q9 (int16, da Σ(N*s)>>14)
+ *   D: Q16 (int32, ISO)
+ *   W = (V*D+32)>>6 (int32)
+ *   sum = Σ_16 W, poi (sum+8)>>4, clamp → int16
+ *
+ * Input:  subband[32] (float) + channel (0=L, 1=R)
+ * Output: pcm_out[j*2+channel] (int16), 32 campioni
+ *
+ * Ottimizzazione: nessun buffer U[512] temporaneo. L'indice V per la step
+ * window è calcolato al volo da m (0..15) e j (0..31).
+ */
+
+void
+synfilt_process(synfilt_state_t *s, const float subband[32],
+                int16_t *pcm_out, int channel)
+{
+    /* (1) Convert subband float → Q15 int32 */
+    int32_t sample[32];
+    for (int k = 0; k < 32; k++)
+    {
+        float v = subband[k] * 32768.0f;
+        if (v >  2147483000.0f) v =  2147483000.0f;
+        if (v < -2147483000.0f) v = -2147483000.0f;
+        sample[k] = (int32_t)v;
+    }
+
+    /* (2) Shift FIFO: avanza offset di -64 (circolare) */
+    s->offset = (s->offset - 64) & 1023;
+    int off = s->offset;
+
+    /* (3) Matricize: V[off+i] = (Σ N[i][k]*sample[k] + 8192) >> 14
+     * N in Q8, sample in Q15 → prod in Q23, sum Q23, shift 14 → Q9. */
+    for (int i = 0; i < 64; i++)
+    {
+        int32_t sum = 0;
+        const int16_t *Nrow = N_matrix[i];
+        for (int k = 0; k < 32; k++)
+        {
+            sum += (int32_t)Nrow[k] * sample[k];
+        }
+        int32_t vv = (sum + 8192) >> 14;
+        if (vv >  32767) vv =  32767;
+        if (vv < -32768) vv = -32768;
+        s->V[(off + i) & 1023] = (int16_t)vv;
+    }
+
+    /* (4+5) Window + Collapse in single pass (no temp U[]).
+     * Per ogni j in 0..31, somma 16 valori Window:
+     *   m even: V[(off + (m>>1)*128 + j) & 1023]
+     *   m odd:  V[(off + (m>>1)*128 + 96 + j) & 1023]
+     * accoppiato con D_window[m*32 + j]. */
+    for (int j = 0; j < 32; j++)
+    {
+        int32_t sum = 0;
+        for (int m = 0; m < 16; m++)
+        {
+            int v_idx = (off + (m >> 1) * 128
+                             + ((m & 1) ? 96 : 0) + j) & 1023;
+            int d_idx = m * 32 + j;
+            int32_t v = (int32_t)s->V[v_idx];
+            int32_t w = (v * D_window[d_idx] + 32) >> 6;
+            sum += w;
+        }
+        /* sum in Q20 (V=Q9, D=Q16, prod Q25, >>6→Q19, somma rimane Q19).
+         * Per uscire in int16 grezzo: >>11 circa. Empiricamente kjmp2
+         * usa >>4 più clamp; replico quello per compat audio. */
+        int32_t out = (sum + 8) >> 4;
+        if (out >  32767) out =  32767;
+        if (out < -32768) out = -32768;
+        pcm_out[j * 2 + channel] = (int16_t)out;
+    }
+}
