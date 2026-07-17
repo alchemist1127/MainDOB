@@ -1,0 +1,7 @@
+# Example font package manifest (type=font).
+# fontd reads weight/italic from each face's OS/2 table, so you only
+# list the files; the family name groups them.
+name=Inter
+family=Inter
+type=font
+faces=Inter-Regular.otf,Inter-Medium.otf,Inter-Bold.otf,Inter-Italic.otf,Inter-BoldItalic.otf

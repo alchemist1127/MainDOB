@@ -1,0 +1,231 @@
+/* MainDOB UHCI Driver - USB 1.0/1.1 (Universal Host Controller Interface)
+ * Intel-style USB 1.x host controller. Uses I/O port access.
+ *
+ * Protocol:
+ *   code=1 GET_STATUS        -> reply.arg0=status_bits
+ *   code=2 PORT_RESET        arg0=port_num
+ *   code=3 CONTROL_TRANSFER  arg0=dev_addr arg1=endpoint payload=setup_packet
+ *   code=4 BULK_TRANSFER     arg0=dev_addr arg1=endpoint payload=data
+ *   code=5 ENUMERATE         -> reply.arg0=num_ports
+ */
+
+#include <unistd.h>
+#include <string.h>
+#include <dob/server.h>
+#include <dob/ipc.h>
+#include <dob/types.h>
+#include <dob/hotplug_driver.h>
+#include <dob/types.h>
+
+/* PCI class/subclass/progif for UHCI */
+#define PCI_CLASS_SERIAL    0x0C
+#define PCI_SUBCLASS_USB    0x03
+#define PCI_PROGIF_UHCI     0x00
+
+/* UHCI I/O register offsets */
+#define UHCI_CMD        0x00    /* USB Command */
+#define UHCI_STS        0x02    /* USB Status */
+#define UHCI_INTR       0x04    /* USB Interrupt Enable */
+#define UHCI_FRNUM      0x06    /* Frame Number */
+#define UHCI_FRBASEADD  0x08    /* Frame List Base Address (32-bit) */
+#define UHCI_SOFMOD     0x0C    /* Start of Frame Modify */
+#define UHCI_PORTSC1    0x10    /* Port 1 Status/Control */
+#define UHCI_PORTSC2    0x12    /* Port 2 Status/Control */
+
+/* UHCI Command Register bits */
+#define UHCI_CMD_RS         (1 << 0)    /* Run/Stop */
+#define UHCI_CMD_HCRESET    (1 << 1)    /* Host Controller Reset */
+#define UHCI_CMD_GRESET     (1 << 2)    /* Global Reset */
+#define UHCI_CMD_MAXP       (1 << 7)    /* Max Packet (64 bytes) */
+
+/* UHCI Status Register bits */
+#define UHCI_STS_USBINT     (1 << 0)    /* USB Interrupt */
+#define UHCI_STS_ERROR      (1 << 1)    /* USB Error Interrupt */
+#define UHCI_STS_RD         (1 << 2)    /* Resume Detect */
+#define UHCI_STS_HSE        (1 << 3)    /* Host System Error */
+#define UHCI_STS_HCPE       (1 << 4)    /* Host Controller Process Error */
+#define UHCI_STS_HCH        (1 << 5)    /* HC Halted */
+
+/* Port Status/Control bits */
+#define UHCI_PORT_CCS       (1 << 0)    /* Current Connect Status */
+#define UHCI_PORT_CSC       (1 << 1)    /* Connect Status Change */
+#define UHCI_PORT_PE        (1 << 2)    /* Port Enable */
+#define UHCI_PORT_PEC       (1 << 3)    /* Port Enable Change */
+#define UHCI_PORT_LSDA      (1 << 8)    /* Low Speed Device Attached */
+#define UHCI_PORT_RESET     (1 << 9)    /* Port Reset */
+#define UHCI_PORT_SUSP      (1 << 12)   /* Suspend */
+
+/* UHCI Transfer Descriptor */
+typedef struct
+{
+    uint32_t link;          /* Next TD pointer (or terminate bit) */
+    uint32_t status;        /* Status and control */
+    uint32_t token;         /* PID, device addr, endpoint, data toggle, max length */
+    uint32_t buffer;        /* Data buffer pointer */
+} __attribute__((packed, aligned(16))) uhci_td_t;
+
+/* UHCI Queue Head */
+typedef struct
+{
+    uint32_t head_link;     /* Next QH horizontal pointer */
+    uint32_t element;       /* First TD pointer */
+} __attribute__((packed, aligned(16))) uhci_qh_t;
+
+/* Frame list: 1024 pointers, one per millisecond frame */
+static uint32_t frame_list[1024] __attribute__((aligned(4096)));
+static uhci_td_t transfer_tds[32] __attribute__((aligned(16)));
+static uhci_qh_t queue_heads[8] __attribute__((aligned(16)));
+
+static uint16_t io_base = 0;
+static uint32_t irq_port = 0;
+static uint8_t  uhci_irq = 0;
+static uint32_t num_ports = 2;
+
+/* Timer-based delay: thread truly sleeps, zero CPU */
+static void uhci_delay(uint32_t ms)
+{
+    int tid = timer_set(irq_port, ms, 0);
+    dob_msg_t wm;
+    memset(&wm, 0, sizeof(wm));
+    dob_ipc_receive(irq_port, &wm);
+    if (wm.type == 3) irq_done(uhci_irq);
+    (void)tid;
+}
+
+static void uhci_reset(void)
+{
+    /* Global reset */
+    io_outw(io_base + UHCI_CMD, UHCI_CMD_GRESET);
+    uhci_delay(50);
+    io_outw(io_base + UHCI_CMD, 0);
+
+    /* Host controller reset */
+    io_outw(io_base + UHCI_CMD, UHCI_CMD_HCRESET);
+    uhci_delay(10);
+    /* Wait for reset to complete — timer-based */
+    for (int i = 0; i < 10; i++)
+    {
+        if (!(io_inw(io_base + UHCI_CMD) & UHCI_CMD_HCRESET)) break;
+        uhci_delay(10);
+    }
+
+    io_outw(io_base + UHCI_STS, 0x003F);
+
+    memset(frame_list, 0, sizeof(frame_list));
+    for (int i = 0; i < 1024; i++)
+        frame_list[i] = 0x01;
+
+    io_outl(io_base + UHCI_FRBASEADD, (uint32_t)frame_list);
+    io_outw(io_base + UHCI_FRNUM, 0);
+    io_outb(io_base + UHCI_SOFMOD, 64);
+    io_outw(io_base + UHCI_INTR, 0x000F);
+}
+
+static void uhci_start(void)
+{
+    io_outw(io_base + UHCI_CMD, UHCI_CMD_RS | UHCI_CMD_MAXP);
+}
+
+static void uhci_port_reset(uint16_t port_reg)
+{
+    uint16_t val = io_inw(io_base + port_reg);
+    io_outw(io_base + port_reg, val | UHCI_PORT_RESET);
+    uhci_delay(50);
+    io_outw(io_base + port_reg, val & ~UHCI_PORT_RESET);
+    uhci_delay(10);
+
+    val = io_inw(io_base + port_reg);
+    io_outw(io_base + port_reg, val | UHCI_PORT_PE);
+    uhci_delay(10);
+
+    io_outw(io_base + port_reg, io_inw(io_base + port_reg) | UHCI_PORT_CSC | UHCI_PORT_PEC);
+}
+
+static bool
+uhci_init_hw(hotplug_device_t *dev)
+{
+    io_base = (uint16_t)(dev->bar[4] & 0xFFFC);
+    if (!io_base) return false;
+
+    pci_enable_bus_master(dev);
+
+    /* Create IRQ port BEFORE any hardware ops */
+    irq_port = (uint32_t)port_create();
+    uhci_irq = dev->irq_line ? dev->irq_line : 11;
+    irq_register(uhci_irq, irq_port);
+
+    uhci_reset();
+    uhci_start();
+
+    return true;
+}
+
+static dob_status_t
+handle_message(dob_msg_t *msg, dob_msg_t *reply)
+{
+    if (dob_driver_is_detach(msg))
+    {
+        dob_driver_released();
+        _exit(0);
+    }
+
+    switch (msg->code)
+    {
+        case 1: /* GET_STATUS */
+        {
+            uint16_t sts = io_inw(io_base + UHCI_STS);
+            uint16_t p1 = io_inw(io_base + UHCI_PORTSC1);
+            uint16_t p2 = io_inw(io_base + UHCI_PORTSC2);
+            reply->arg0 = sts;
+            reply->arg1 = p1;
+            reply->arg2 = p2;
+            return DOB_OK;
+        }
+
+        case 2: /* PORT_RESET */
+        {
+            uint32_t port_num = msg->arg0;
+            if (port_num == 0)
+                uhci_port_reset(UHCI_PORTSC1);
+            else if (port_num == 1)
+                uhci_port_reset(UHCI_PORTSC2);
+            else
+                return DOB_ERR_INVALID;
+            return DOB_OK;
+        }
+
+        case 5: /* ENUMERATE */
+            reply->arg0 = num_ports;
+            reply->arg1 = (io_inw(io_base + UHCI_PORTSC1) & UHCI_PORT_CCS) ? 1 : 0;
+            reply->arg2 = (io_inw(io_base + UHCI_PORTSC2) & UHCI_PORT_CCS) ? 1 : 0;
+            return DOB_OK;
+
+        default:
+            return DOB_ERR_INVALID;
+    }
+}
+
+int
+main(void)
+{
+    hotplug_device_t dev;
+
+    dob_server_init("usb_uhci");
+
+    if (dob_driver_attach(&dev))
+    {
+        if (uhci_init_hw(&dev))
+            debug_print("[uhci] Initialized.\n");
+        else
+            debug_print("[uhci] Init failed.\n");
+    }
+    else
+    {
+        debug_print("[uhci] No device assigned.\n");
+    }
+
+    dob_server_register(handle_message);
+    debug_print("[uhci] Ready.\n");
+    dob_server_loop();
+    return 0;
+}
