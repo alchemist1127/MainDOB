@@ -1,0 +1,1117 @@
+/* MainDOB DobPicture — Bitmap Paint Program
+ *
+ * Architecture:
+ *   Canvas: uint32_t pixel buffer (BGR format, 0x00BBGGRR)
+ *           Up to 4096x4096. Allocated via malloc.
+ *   Viewport: scrollable/zoomable view into the canvas.
+ *   Palette: 18 fixed colors + 6 user-defined slots.
+ *   RGB mixer: 3 sliders (0-255) + textboxes + live preview.
+ *   Tools: pencil, eraser, rectangle, circle, with size control.
+ *   Export: BMP 24-bit (extensible to JPG/PNG).
+ *   File I/O: via DobFileSystem Entry Point stubs.
+ *
+ * Panel commands: Nuovo, Apri, Salva, Esporta BMP
+ *
+ * Future (V2): fountain pen, airbrush, selection/copy,
+ *              fill tool, undo, JPG/PNG, Entry Point API.
+ */
+
+#include <unistd.h>
+#include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <app.h>
+#include <DobInterface.h>
+#include <DobFileSystem.h>
+#include <DobPopup.h>
+#include <DobFiles.h>
+#include <dob/types.h>
+
+#include <label.h>
+#include <button.h>
+#include <picturebutton.h>
+#include <slider.h>
+#include <textbox.h>
+#include <separator.h>
+
+/* Constants */
+
+#define WIN_W           700
+#define WIN_H           560
+#define TOOLBAR_H       30
+#define PALETTE_W       108
+#define PAL_CELL        22
+#define PAL_COLS        4
+#define PAL_ROWS        6
+#define PAL_PAD         6
+#define RGB_SLIDER_W    80
+#define PREVIEW_SIZE    28
+
+#define DEFAULT_CW      640
+#define DEFAULT_CH      480
+#define MAX_CW          4096
+#define MAX_CH          4096
+#define MAX_BRUSH       32
+#define MAX_ZOOM        16
+
+#include <dobui_theme.h>
+#define COL_BG          DOBUI_SURFACE
+#define COL_TOOLBAR     DOBUI_INSET
+#define COL_DARK        DOBUI_RELIEF
+#define COL_WHITE       DOBUI_TEXT_ALT
+#define COL_CANVAS_BG   DOBUI_INSET
+
+/* Tools */
+enum
+{
+    TOOL_PENCIL = 0,
+    TOOL_ERASER,
+    TOOL_RECT,
+    TOOL_CIRCLE,
+    TOOL_COUNT
+};
+
+/* Tool icons — 16x16, 0x00RRGGBB, transparency 0xFF000000 */
+
+#define _I  0xFF000000
+#define _X  0x00000000
+
+/* Pencil — diagonal stroke */
+static const uint32_t icon_pencil[256] =
+{
+    _I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_X,_X,_I,
+    _I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_X,_X,_X,_I,
+    _I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_X,_X,_I,_I,_I,
+    _I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_X,_X,_I,_I,_I,_I,
+    _I,_I,_I,_I,_I,_I,_I,_I,_I,_X,_X,_I,_I,_I,_I,_I,
+    _I,_I,_I,_I,_I,_I,_I,_I,_X,_X,_I,_I,_I,_I,_I,_I,
+    _I,_I,_I,_I,_I,_I,_I,_X,_X,_I,_I,_I,_I,_I,_I,_I,
+    _I,_I,_I,_I,_I,_I,_X,_X,_I,_I,_I,_I,_I,_I,_I,_I,
+    _I,_I,_I,_I,_I,_X,_X,_I,_I,_I,_I,_I,_I,_I,_I,_I,
+    _I,_I,_I,_I,_X,_X,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,
+    _I,_I,_I,_X,_X,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,
+    _I,_I,_X,_X,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,
+    _I,_X,_X,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,
+    _I,_X,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,
+    _X,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,
+    _I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,
+};
+
+/* Eraser — solid block */
+static const uint32_t icon_eraser[256] =
+{
+    _I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,
+    _I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,
+    _I,_I,_X,_X,_X,_X,_X,_X,_X,_X,_X,_X,_X,_I,_I,_I,
+    _I,_I,_X,_X,_X,_X,_X,_X,_X,_X,_X,_X,_X,_I,_I,_I,
+    _I,_I,_X,_X,_I,_I,_I,_I,_I,_I,_I,_X,_X,_I,_I,_I,
+    _I,_I,_X,_X,_I,_I,_I,_I,_I,_I,_I,_X,_X,_I,_I,_I,
+    _I,_I,_X,_X,_I,_I,_I,_I,_I,_I,_I,_X,_X,_I,_I,_I,
+    _I,_I,_X,_X,_I,_I,_I,_I,_I,_I,_I,_X,_X,_I,_I,_I,
+    _I,_I,_X,_X,_I,_I,_I,_I,_I,_I,_I,_X,_X,_I,_I,_I,
+    _I,_I,_X,_X,_I,_I,_I,_I,_I,_I,_I,_X,_X,_I,_I,_I,
+    _I,_I,_X,_X,_I,_I,_I,_I,_I,_I,_I,_X,_X,_I,_I,_I,
+    _I,_I,_X,_X,_X,_X,_X,_X,_X,_X,_X,_X,_X,_I,_I,_I,
+    _I,_I,_X,_X,_X,_X,_X,_X,_X,_X,_X,_X,_X,_I,_I,_I,
+    _I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,
+    _I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,
+    _I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,
+};
+
+/* Rectangle — outline */
+static const uint32_t icon_rect[256] =
+{
+    _I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,
+    _I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,
+    _I,_I,_X,_X,_X,_X,_X,_X,_X,_X,_X,_X,_X,_I,_I,_I,
+    _I,_I,_X,_I,_I,_I,_I,_I,_I,_I,_I,_I,_X,_I,_I,_I,
+    _I,_I,_X,_I,_I,_I,_I,_I,_I,_I,_I,_I,_X,_I,_I,_I,
+    _I,_I,_X,_I,_I,_I,_I,_I,_I,_I,_I,_I,_X,_I,_I,_I,
+    _I,_I,_X,_I,_I,_I,_I,_I,_I,_I,_I,_I,_X,_I,_I,_I,
+    _I,_I,_X,_I,_I,_I,_I,_I,_I,_I,_I,_I,_X,_I,_I,_I,
+    _I,_I,_X,_I,_I,_I,_I,_I,_I,_I,_I,_I,_X,_I,_I,_I,
+    _I,_I,_X,_I,_I,_I,_I,_I,_I,_I,_I,_I,_X,_I,_I,_I,
+    _I,_I,_X,_I,_I,_I,_I,_I,_I,_I,_I,_I,_X,_I,_I,_I,
+    _I,_I,_X,_X,_X,_X,_X,_X,_X,_X,_X,_X,_X,_I,_I,_I,
+    _I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,
+    _I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,
+    _I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,
+    _I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,
+};
+
+/* Circle — outline */
+static const uint32_t icon_circle[256] =
+{
+    _I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,
+    _I,_I,_I,_I,_I,_X,_X,_X,_X,_X,_I,_I,_I,_I,_I,_I,
+    _I,_I,_I,_X,_X,_I,_I,_I,_I,_I,_X,_X,_I,_I,_I,_I,
+    _I,_I,_X,_I,_I,_I,_I,_I,_I,_I,_I,_I,_X,_I,_I,_I,
+    _I,_I,_X,_I,_I,_I,_I,_I,_I,_I,_I,_I,_X,_I,_I,_I,
+    _I,_X,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_X,_I,_I,
+    _I,_X,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_X,_I,_I,
+    _I,_X,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_X,_I,_I,
+    _I,_X,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_X,_I,_I,
+    _I,_X,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_X,_I,_I,
+    _I,_I,_X,_I,_I,_I,_I,_I,_I,_I,_I,_I,_X,_I,_I,_I,
+    _I,_I,_X,_I,_I,_I,_I,_I,_I,_I,_I,_I,_X,_I,_I,_I,
+    _I,_I,_I,_X,_X,_I,_I,_I,_I,_I,_X,_X,_I,_I,_I,_I,
+    _I,_I,_I,_I,_I,_X,_X,_X,_X,_X,_I,_I,_I,_I,_I,_I,
+    _I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,
+    _I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,_I,
+};
+
+static const uint32_t *tool_icons[TOOL_COUNT] =
+{
+    icon_pencil, icon_eraser, icon_rect, icon_circle
+};
+
+#undef _I
+#undef _X
+
+/* Palette — 18 base + 6 custom = 24 slots */
+
+#define PAL_TOTAL       24
+#define PAL_BASE        18
+
+static uint32_t palette[PAL_TOTAL] =
+{
+    /* Row 1: basics */
+    0x00000000, 0x00FFFFFF, 0x00808080, 0x00C0C0C0,
+    /* Row 2: reds/greens */
+    0x000000FF, 0x00000080, 0x0000FF00, 0x00008000,
+    /* Row 3: blues/yellow */
+    0x00FF0000, 0x00800000, 0x0000FFFF, 0x000088FF,
+    /* Row 4: purple/cyan/brown */
+    0x00FF00FF, 0x00800080, 0x00FFFF00, 0x00004080,
+    /* Row 5: pink/lime */
+    0x008080FF, 0x0000FF80,
+    /* Custom slots (6) — default grays */
+    0x00202020, 0x00404040, 0x00606060,
+    0x00A0A0A0, 0x00D0D0D0, 0x00F0F0F0,
+};
+
+/* State */
+
+static uint32_t win_id;
+static int win_w = WIN_W, win_h = WIN_H;
+
+/* Canvas */
+static uint32_t *canvas = NULL;
+static int canvas_w = DEFAULT_CW, canvas_h = DEFAULT_CH;
+
+/* Viewport */
+static int vp_x, vp_y, vp_w, vp_h;
+static int scroll_x = 0, scroll_y = 0;
+static int zoom = 1;
+
+/* Drawing */
+static int current_tool = TOOL_PENCIL;
+static int current_color_idx = 0;
+static uint32_t current_color = 0x00000000;
+static int brush_size = 2;
+static int last_draw_x = -1, last_draw_y = -1;
+static bool drawing_shape = false;
+static int shape_start_x, shape_start_y;
+
+/* RGB mixer */
+static int rgb_r = 0, rgb_g = 0, rgb_b = 0;
+
+/* File */
+static char current_file[256] = {0};
+static const char *g_openfile = NULL;
+static bool modified = false;
+
+/* Canvas management */
+
+static bool canvas_alloc(int w, int h)
+{
+    if (w < 1 || h < 1 || w > MAX_CW || h > MAX_CH) return false;
+    uint32_t *buf = (uint32_t *)malloc((uint32_t)(w * h) * 4);
+    if (!buf) return false;
+    if (canvas) free(canvas);
+    canvas = buf;
+    canvas_w = w;
+    canvas_h = h;
+    for (int i = 0; i < w * h; i++)
+        canvas[i] = COL_CANVAS_BG;
+    scroll_x = 0;
+    scroll_y = 0;
+    modified = false;
+    return true;
+}
+
+static inline uint32_t canvas_get(int x, int y)
+{
+    if (x < 0 || x >= canvas_w || y < 0 || y >= canvas_h)
+        return COL_CANVAS_BG;
+    return canvas[y * canvas_w + x];
+}
+
+static inline void canvas_set(int x, int y, uint32_t col)
+{
+    if (x >= 0 && x < canvas_w && y >= 0 && y < canvas_h)
+        canvas[y * canvas_w + x] = col;
+}
+
+/* Screen coords to canvas coords */
+static bool screen_to_canvas(int sx, int sy, int *cx, int *cy)
+{
+    if (sx < vp_x || sx >= vp_x + vp_w || sy < vp_y || sy >= vp_y + vp_h)
+        return false;
+    *cx = (sx - vp_x) / zoom + scroll_x;
+    *cy = (sy - vp_y) / zoom + scroll_y;
+    return true;
+}
+
+/* Viewport rendering — run-length optimized */
+
+static void update_viewport_rect(void)
+{
+    vp_x = PALETTE_W;
+    vp_y = TOOLBAR_H;
+    vp_w = win_w - PALETTE_W;
+    vp_h = win_h - TOOLBAR_H;
+}
+
+static void draw_viewport(void)
+{
+    int vis_w = vp_w / zoom;
+    int vis_h = vp_h / zoom;
+
+    for (int row = 0; row < vis_h && row * zoom < vp_h; row++)
+    {
+        int cy = row + scroll_y;
+        int sx = vp_x;
+        int sy = vp_y + row * zoom;
+
+        int col = 0;
+        while (col < vis_w && col * zoom < vp_w)
+        {
+            int cx = col + scroll_x;
+            uint32_t color = canvas_get(cx, cy);
+
+            /* Run-length: find consecutive same-colored pixels */
+            int run = 1;
+            while (col + run < vis_w && (col + run) * zoom < vp_w
+                   && canvas_get(cx + run, cy) == color)
+                run++;
+
+            int rw = run * zoom;
+            if (sx + rw > vp_x + vp_w)
+                rw = vp_x + vp_w - sx;
+
+            int rh = zoom;
+            if (sy + rh > vp_y + vp_h)
+                rh = vp_y + vp_h - sy;
+
+            dobui_FillRect(win_id, sx, sy, rw, rh, color);
+            sx += run * zoom;
+            col += run;
+        }
+
+        /* Fill remaining viewport width if canvas is narrower */
+        if (sx < vp_x + vp_w)
+            dobui_FillRect(win_id, sx, sy, vp_x + vp_w - sx, zoom, COL_BG);
+    }
+
+    /* Fill remaining viewport height if canvas is shorter */
+    int drawn_h = vis_h * zoom;
+    if (drawn_h < vp_h)
+        dobui_FillRect(win_id, vp_x, vp_y + drawn_h,
+                       vp_w, vp_h - drawn_h, COL_BG);
+}
+
+/* Drawing tools */
+
+static void paint_dot(int cx, int cy, uint32_t col, int size)
+{
+    int half = size / 2;
+    for (int dy = -half; dy < size - half; dy++)
+        for (int dx = -half; dx < size - half; dx++)
+            canvas_set(cx + dx, cy + dy, col);
+    modified = true;
+}
+
+/* Bresenham line with brush */
+static void paint_line(int x0, int y0, int x1, int y1, uint32_t col, int size)
+{
+    int dx = x1 - x0, dy = y1 - y0;
+    int adx = (dx < 0) ? -dx : dx;
+    int ady = (dy < 0) ? -dy : dy;
+    int sx = (dx > 0) ? 1 : -1;
+    int sy = (dy > 0) ? 1 : -1;
+    int err = adx - ady;
+
+    for (;;)
+    {
+        paint_dot(x0, y0, col, size);
+        if (x0 == x1 && y0 == y1) break;
+        int e2 = 2 * err;
+        if (e2 > -ady) { err -= ady; x0 += sx; }
+        if (e2 <  adx) { err += adx; y0 += sy; }
+    }
+}
+
+static void paint_rect_outline(int x0, int y0, int x1, int y1, uint32_t col, int size)
+{
+    if (x0 > x1) { int t = x0; x0 = x1; x1 = t; }
+    if (y0 > y1) { int t = y0; y0 = y1; y1 = t; }
+    paint_line(x0, y0, x1, y0, col, size);
+    paint_line(x1, y0, x1, y1, col, size);
+    paint_line(x1, y1, x0, y1, col, size);
+    paint_line(x0, y1, x0, y0, col, size);
+}
+
+static void paint_circle_outline(int cx, int cy, int r, uint32_t col, int size)
+{
+    int x = r, y = 0, err = 1 - r;
+    while (x >= y)
+    {
+        paint_dot(cx + x, cy + y, col, size);
+        paint_dot(cx - x, cy + y, col, size);
+        paint_dot(cx + x, cy - y, col, size);
+        paint_dot(cx - x, cy - y, col, size);
+        paint_dot(cx + y, cy + x, col, size);
+        paint_dot(cx - y, cy + x, col, size);
+        paint_dot(cx + y, cy - x, col, size);
+        paint_dot(cx - y, cy - x, col, size);
+        y++;
+        if (err < 0) err += 2 * y + 1;
+        else { x--; err += 2 * (y - x) + 1; }
+    }
+}
+
+/* Robust I/O helpers — accumulate partial reads/writes */
+
+static int read_full(int fd, void *buf, uint32_t size)
+{
+    uint32_t total = 0;
+    while (total < size)
+    {
+        int got = dobfs_Read(fd, (uint8_t *)buf + total, size - total);
+        if (got <= 0) break;
+        total += (uint32_t)got;
+    }
+    return (int)total;
+}
+
+static int write_full(int fd, const void *buf, uint32_t size)
+{
+    uint32_t total = 0;
+    while (total < size)
+    {
+        int wrote = dobfs_Write(fd, (const uint8_t *)buf + total, size - total);
+        if (wrote <= 0) break;
+        total += (uint32_t)wrote;
+    }
+    return (int)total;
+}
+
+/* BMP Export */
+
+static void export_bmp(const char *path)
+{
+    int row_stride = ((canvas_w * 3 + 3) / 4) * 4;
+    uint32_t data_size = (uint32_t)(row_stride * canvas_h);
+    uint32_t file_size = 54 + data_size;
+
+    { char d[128]; snprintf(d, sizeof(d), "[DobPicture] SAVE %dx%d stride=%d total=%u\n",
+      canvas_w, canvas_h, row_stride, file_size); debug_print(d); }
+
+    int fd = dobfs_Open(path, FS_WRITE | FS_CREATE | FS_TRUNC);
+    if (fd < 0) { debug_print("[DobPicture] SAVE: Open failed\n"); return; }
+
+    /* File header (14 bytes) */
+    uint8_t fh[14] = {0};
+    fh[0] = 'B'; fh[1] = 'M';
+    fh[2] = file_size & 0xFF; fh[3] = (file_size >> 8) & 0xFF;
+    fh[4] = (file_size >> 16) & 0xFF; fh[5] = (file_size >> 24) & 0xFF;
+    fh[10] = 54;
+    if (write_full(fd, fh, 14) != 14) { debug_print("[DobPicture] SAVE: fh write fail\n"); dobfs_Close(fd); return; }
+
+    /* Info header (40 bytes) */
+    uint8_t ih[40] = {0};
+    ih[0] = 40;
+    ih[4]  = canvas_w & 0xFF; ih[5]  = (canvas_w >> 8) & 0xFF;
+    ih[8]  = canvas_h & 0xFF; ih[9]  = (canvas_h >> 8) & 0xFF;
+    ih[12] = 1; /* planes */
+    ih[14] = 24; /* bpp */
+    ih[20] = data_size & 0xFF; ih[21] = (data_size >> 8) & 0xFF;
+    ih[22] = (data_size >> 16) & 0xFF; ih[23] = (data_size >> 24) & 0xFF;
+    if (write_full(fd, ih, 40) != 40) { debug_print("[DobPicture] SAVE: ih write fail\n"); dobfs_Close(fd); return; }
+
+    /* Pixel data — bottom-up, BGR */
+    uint8_t row_buf[MAX_CW * 3 + 4];
+    int rows_written = 0;
+    for (int y = canvas_h - 1; y >= 0; y--)
+    {
+        int pos = 0;
+        for (int x = 0; x < canvas_w; x++)
+        {
+            uint32_t c = canvas[y * canvas_w + x];
+            /* Il canvas e' 0x00RRGGBB (la palette lo dimostra: 0x0000FF
+             * e' il blu); il BMP su disco vuole B,G,R. Il vecchio codec
+             * swappava R<->B in ENTRAMBE le direzioni: i round-trip dei
+             * propri file tornavano (doppio swap = identita'), ma i BMP
+             * salvati erano NON-standard su disco, e ogni BMP standard
+             * esterno (screenshot di sistema, file dal mondo reale) si
+             * apriva coi canali invertiti. */
+            row_buf[pos++] = c & 0xFF;          /* B */
+            row_buf[pos++] = (c >> 8) & 0xFF;   /* G */
+            row_buf[pos++] = (c >> 16) & 0xFF;  /* R */
+        }
+        while (pos < row_stride) row_buf[pos++] = 0;
+        if (write_full(fd, row_buf, (uint32_t)row_stride) != row_stride)
+            break;
+        rows_written++;
+    }
+
+    dobfs_Close(fd);
+    { char d[128]; snprintf(d, sizeof(d), "[DobPicture] SAVE done: %d/%d rows, px[0,0]=0x%08X\n",
+      rows_written, canvas_h, canvas[0]); debug_print(d); }
+}
+
+/* BMP Import */
+
+static bool import_bmp(const char *path)
+{
+    debug_print("[DobPicture] LOAD: ");
+    debug_print(path);
+    debug_print("\n");
+
+    int fd = dobfs_Open(path, FS_READ);
+    if (fd < 0) { debug_print("[DobPicture] LOAD: Open failed\n"); return false; }
+
+    /* Read headers */
+    uint8_t hdr[54];
+    int hdr_got = read_full(fd, hdr, 54);
+    if (hdr_got < 54)
+    {
+        { char d[80]; snprintf(d, sizeof(d), "[DobPicture] LOAD: hdr read %d/54\n", hdr_got); debug_print(d); }
+        dobfs_Close(fd);
+        return false;
+    }
+
+    if (hdr[0] != 'B' || hdr[1] != 'M')
+    {
+        debug_print("[DobPicture] LOAD: not BMP\n");
+        dobfs_Close(fd);
+        return false;
+    }
+
+    int bw = (int)(hdr[18] | (hdr[19] << 8) | (hdr[20] << 16) | (hdr[21] << 24));
+    int bh = (int)(hdr[22] | (hdr[23] << 8) | (hdr[24] << 16) | (hdr[25] << 24));
+    int bpp = hdr[28] | (hdr[29] << 8);
+    uint32_t data_off = hdr[10] | (hdr[11] << 8) | (hdr[12] << 16) | (hdr[13] << 24);
+
+    { char d[128]; snprintf(d, sizeof(d), "[DobPicture] LOAD: %dx%d bpp=%d off=%u\n",
+      bw, bh, bpp, data_off); debug_print(d); }
+
+    bool bottom_up = (bh > 0);
+    if (bh < 0) bh = -bh;
+
+    if (bw <= 0 || bh <= 0 || bw > MAX_CW || bh > MAX_CH || (bpp != 24 && bpp != 32))
+    {
+        debug_print("[DobPicture] LOAD: invalid dims/bpp\n");
+        dobfs_Close(fd);
+        return false;
+    }
+
+    if (!canvas_alloc(bw, bh))
+    {
+        debug_print("[DobPicture] LOAD: canvas_alloc fail\n");
+        dobfs_Close(fd);
+        return false;
+    }
+
+    /* Seek to pixel data (skip extra header bytes) */
+    if (data_off > 54)
+    {
+        uint8_t skip[256];
+        uint32_t remaining = data_off - 54;
+        while (remaining > 0)
+        {
+            uint32_t chunk = (remaining > 256) ? 256 : remaining;
+            if (read_full(fd, skip, chunk) < (int)chunk) break;
+            remaining -= chunk;
+        }
+    }
+
+    int bytes_per_pixel = bpp / 8;
+    int row_stride = ((bw * bytes_per_pixel + 3) / 4) * 4;
+    uint8_t row_buf[MAX_CW * 4 + 4];
+    int rows_read = 0;
+
+    for (int row = 0; row < bh; row++)
+    {
+        int y = bottom_up ? (bh - 1 - row) : row;
+        if (read_full(fd, row_buf, (uint32_t)row_stride) < row_stride)
+            break;
+
+        for (int x = 0; x < bw; x++)
+        {
+            int off = x * bytes_per_pixel;
+            uint8_t b = row_buf[off];
+            uint8_t g = row_buf[off + 1];
+            uint8_t r = row_buf[off + 2];
+            /* Disco B,G,R -> canvas 0x00RRGGBB (vedi nota nel save). */
+            canvas[y * bw + x] = ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+        }
+        rows_read++;
+    }
+
+    dobfs_Close(fd);
+    { char d[128]; snprintf(d, sizeof(d), "[DobPicture] LOAD done: %d/%d rows, px[0,0]=0x%08X\n",
+      rows_read, bh, canvas[0]); debug_print(d); }
+    return (rows_read > 0);
+}
+
+/* Toolbar */
+static dob_picturebutton_t btn_tools[TOOL_COUNT];
+static dob_button_t btn_brush_up, btn_brush_dn;
+static dob_button_t btn_zoom_in, btn_zoom_out;
+static dob_label_t lbl_brush, lbl_zoom;
+
+/* RGB mixer */
+static dob_slider_t sl_r, sl_g, sl_b;
+static dob_textbox_t tb_r, tb_g, tb_b;
+static dob_label_t lbl_r, lbl_g, lbl_b;
+
+/* Status */
+static dob_label_t lbl_info;
+
+static void update_color_from_rgb(void)
+{
+    current_color = ((uint32_t)rgb_b << 16) | ((uint32_t)rgb_g << 8) | (uint32_t)rgb_r;
+}
+
+static void rgb_from_color(uint32_t c)
+{
+    rgb_r = c & 0xFF;
+    rgb_g = (c >> 8) & 0xFF;
+    rgb_b = (c >> 16) & 0xFF;
+}
+
+static void sync_rgb_controls(void)
+{
+    sl_r.value = rgb_r; sl_g.value = rgb_g; sl_b.value = rgb_b;
+    char buf[8];
+    snprintf(buf, sizeof(buf), "%d", rgb_r); dobtb_SetText(&tb_r, buf);
+    snprintf(buf, sizeof(buf), "%d", rgb_g); dobtb_SetText(&tb_g, buf);
+    snprintf(buf, sizeof(buf), "%d", rgb_b); dobtb_SetText(&tb_b, buf);
+}
+
+static void select_palette_color(int idx)
+{
+    if (idx < 0 || idx >= PAL_TOTAL) return;
+    current_color_idx = idx;
+    current_color = palette[idx];
+    rgb_from_color(current_color);
+    sync_rgb_controls();
+}
+
+static void update_brush_label(void)
+{
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%dpx", brush_size);
+    doblbl_SetText(&lbl_brush, buf);
+}
+
+static void update_zoom_label(void)
+{
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%dx", zoom);
+    doblbl_SetText(&lbl_zoom, buf);
+}
+
+static void init_controls(void)
+{
+    int tx = 4;
+
+    /* Tool buttons (picture buttons with icons) */
+    for (int i = 0; i < TOOL_COUNT; i++)
+    {
+        dobpbtn_Init(&btn_tools[i], win_id, tx, 3, 24, 24);
+        dobpbtn_SetImage(&btn_tools[i], tool_icons[i], 16, 16);
+        tx += 28;
+    }
+
+    /* Brush size */
+    tx += 8;
+    dobbtn_Init(&btn_brush_dn, win_id, tx, 4, 22, 22, "-");
+    tx += 24;
+    doblbl_InitWithBg(&lbl_brush, win_id, tx, 6, " 2px ", COL_DARK, COL_TOOLBAR);
+    tx += 42;
+    dobbtn_Init(&btn_brush_up, win_id, tx, 4, 22, 22, "+");
+
+    /* Zoom */
+    tx += 32;
+    dobbtn_Init(&btn_zoom_out, win_id, tx, 4, 22, 22, "-");
+    tx += 24;
+    doblbl_InitWithBg(&lbl_zoom, win_id, tx, 6, " 1x ", COL_DARK, COL_TOOLBAR);
+    tx += 36;
+    dobbtn_Init(&btn_zoom_in, win_id, tx, 4, 22, 22, "+");
+
+    /* RGB sliders (in palette area) */
+    int ry = TOOLBAR_H + PAL_ROWS * PAL_CELL + PAL_PAD * 2 + 8;
+
+    doblbl_Init(&lbl_r, win_id, 4, ry + 2, "B");
+    lbl_r.col_text = 0x00CC0000; lbl_r.col_bg = COL_BG;
+    dobsl_Init(&sl_r, win_id, 14, ry, RGB_SLIDER_W, 14);
+    sl_r.max = 255; sl_r.col_fill = 0x00CC0000;
+    dobtb_Init(&tb_r, win_id, 14 + RGB_SLIDER_W + 2, ry - 1, 30, 16);
+    dobtb_SetText(&tb_r, "0");
+    ry += 20;
+
+    doblbl_Init(&lbl_g, win_id, 4, ry + 2, "G");
+    lbl_g.col_text = 0x0000AA00; lbl_g.col_bg = COL_BG;
+    dobsl_Init(&sl_g, win_id, 14, ry, RGB_SLIDER_W, 14);
+    sl_g.max = 255; sl_g.col_fill = 0x0000AA00;
+    dobtb_Init(&tb_g, win_id, 14 + RGB_SLIDER_W + 2, ry - 1, 30, 16);
+    dobtb_SetText(&tb_g, "0");
+    ry += 20;
+
+    doblbl_Init(&lbl_b, win_id, 4, ry + 2, "R");
+    lbl_b.col_text = 0x000000CC; lbl_b.col_bg = COL_BG;
+    dobsl_Init(&sl_b, win_id, 14, ry, RGB_SLIDER_W, 14);
+    sl_b.max = 255; sl_b.col_fill = 0x000000CC;
+    dobtb_Init(&tb_b, win_id, 14 + RGB_SLIDER_W + 2, ry - 1, 30, 16);
+    dobtb_SetText(&tb_b, "0");
+
+    /* Info label at bottom of palette */
+    int info_y = win_h - 18;
+    doblbl_Init(&lbl_info, win_id, 4, info_y, "640x480");
+    lbl_info.col_text = COL_DARK; lbl_info.col_bg = COL_BG;
+
+    /* Initial state */
+    btn_tools[0].col_bg = DOBUI_INPUT;
+    select_palette_color(0);
+    update_brush_label();
+    update_zoom_label();
+    update_viewport_rect();
+}
+
+/* Drawing UI */
+
+static void draw_toolbar(void)
+{
+    dobui_FillRect(win_id, 0, 0, win_w, TOOLBAR_H, COL_TOOLBAR);
+    for (int i = 0; i < TOOL_COUNT; i++) dobpbtn_Draw(&btn_tools[i]);
+    dobbtn_Draw(&btn_brush_dn); doblbl_Draw(&lbl_brush); dobbtn_Draw(&btn_brush_up);
+    dobbtn_Draw(&btn_zoom_out); doblbl_Draw(&lbl_zoom);  dobbtn_Draw(&btn_zoom_in);
+}
+
+static void draw_palette(void)
+{
+    int px = PAL_PAD, py = TOOLBAR_H + PAL_PAD;
+
+    for (int i = 0; i < PAL_TOTAL; i++)
+    {
+        int col = i % PAL_COLS;
+        int row = i / PAL_COLS;
+        int cx = px + col * PAL_CELL;
+        int cy = py + row * PAL_CELL;
+
+        dobui_FillRect(win_id, cx, cy, PAL_CELL - 2, PAL_CELL - 2, palette[i]);
+        if (i == current_color_idx)
+            dobui_DrawRect(win_id, cx - 1, cy - 1, PAL_CELL, PAL_CELL, COL_WHITE);
+    }
+
+    /* RGB sliders */
+    doblbl_Draw(&lbl_r); dobsl_Draw(&sl_r); dobtb_Draw(&tb_r);
+    doblbl_Draw(&lbl_g); dobsl_Draw(&sl_g); dobtb_Draw(&tb_g);
+    doblbl_Draw(&lbl_b); dobsl_Draw(&sl_b); dobtb_Draw(&tb_b);
+
+    /* Color preview */
+    int prev_y = sl_b.y + 24;
+    dobui_FillRect(win_id, PAL_PAD, prev_y, PREVIEW_SIZE, PREVIEW_SIZE, current_color);
+    dobui_DrawRect(win_id, PAL_PAD, prev_y, PREVIEW_SIZE, PREVIEW_SIZE, COL_DARK);
+
+    /* Custom slot indicator */
+    if (current_color_idx >= PAL_BASE)
+    {
+        doblbl_Draw(&lbl_info);
+    }
+}
+
+static void draw_all(void)
+{
+    dobui_FillRect(win_id, 0, TOOLBAR_H, PALETTE_W, win_h - TOOLBAR_H, COL_BG);
+    draw_toolbar();
+    draw_palette();
+    draw_viewport();
+    doblbl_Draw(&lbl_info);
+    dobui_Invalidate(win_id);
+}
+
+/* Tool handling */
+
+static void select_tool(int tool)
+{
+    for (int i = 0; i < TOOL_COUNT; i++)
+        btn_tools[i].col_bg = (i == tool) ? DOBUI_INPUT : DOBPBTN_COL_BG;
+    current_tool = tool;
+    drawing_shape = false;
+    last_draw_x = -1;
+}
+
+static void tool_press(int cx, int cy)
+{
+    uint32_t col = (current_tool == TOOL_ERASER) ? COL_CANVAS_BG : current_color;
+
+    switch (current_tool)
+    {
+        case TOOL_PENCIL:
+        case TOOL_ERASER:
+            if (last_draw_x >= 0)
+                paint_line(last_draw_x, last_draw_y, cx, cy, col, brush_size);
+            else
+                paint_dot(cx, cy, col, brush_size);
+            last_draw_x = cx;
+            last_draw_y = cy;
+            draw_viewport();
+            break;
+
+        case TOOL_RECT:
+        case TOOL_CIRCLE:
+            shape_start_x = cx;
+            shape_start_y = cy;
+            drawing_shape = true;
+            break;
+    }
+}
+
+static void tool_release(int cx, int cy)
+{
+    if (!drawing_shape) return;
+    drawing_shape = false;
+
+    uint32_t col = current_color;
+
+    if (current_tool == TOOL_RECT)
+    {
+        paint_rect_outline(shape_start_x, shape_start_y, cx, cy, col, brush_size);
+    }
+    else if (current_tool == TOOL_CIRCLE)
+    {
+        int dx = cx - shape_start_x;
+        int dy = cy - shape_start_y;
+        int r = 0;
+        /* Integer sqrt approximation */
+        int sq = dx * dx + dy * dy;
+        while (r * r < sq) r++;
+        paint_circle_outline(shape_start_x, shape_start_y, r, col, brush_size);
+    }
+
+    draw_viewport();
+}
+
+/* File operations */
+
+static void file_new(void)
+{
+    canvas_alloc(DEFAULT_CW, DEFAULT_CH);
+    current_file[0] = '\0';
+    modified = false;
+    char buf[32]; snprintf(buf, sizeof(buf), "%dx%d", canvas_w, canvas_h);
+    doblbl_SetText(&lbl_info, buf);
+    draw_all();
+}
+
+static void file_open(void)
+{
+    char path[256] = {0};
+    if (dobfiles_PickFile(".bmp", "/DATA/Pictures", path, sizeof(path)) != 0
+        || !path[0])
+        return;
+
+    if (import_bmp(path))
+    {
+        strncpy(current_file, path, sizeof(current_file) - 1);
+        modified = false;
+        scroll_x = 0; scroll_y = 0;
+        char buf[32]; snprintf(buf, sizeof(buf), "%dx%d", canvas_w, canvas_h);
+        doblbl_SetText(&lbl_info, buf);
+        draw_all();
+    }
+}
+
+static void file_save(void)
+{
+    if (current_file[0] == '\0')
+    {
+        char path[256] = {0};
+        if (dobfiles_PickSavePath("immagine.bmp", ".bmp",
+                                  "/DATA/Pictures", path, sizeof(path)) == 0
+            && path[0])
+        {
+            strncpy(current_file, path, sizeof(current_file) - 1);
+        }
+        else return;
+    }
+    export_bmp(current_file);
+    modified = false;
+}
+
+static void file_export_bmp(void)
+{
+    char path[256] = {0};
+    if (dobfiles_PickSavePath("esporta.bmp", ".bmp",
+                              "/DATA/Pictures", path, sizeof(path)) == 0
+        && path[0])
+    {
+        export_bmp(path);
+    }
+}
+
+/* Event handlers */
+
+void event_mouseclick(int x, int y, uint8_t buttons)
+{
+    (void)buttons;
+
+    /* Toolbar buttons */
+    for (int i = 0; i < TOOL_COUNT; i++)
+    {
+        if (dobpbtn_OnClick(&btn_tools[i], x, y))
+        {
+            btn_tools[i].clicked = false;
+            select_tool(i);
+            draw_all(); return;
+        }
+    }
+    if (dobbtn_OnClick(&btn_brush_up, x, y))
+    {
+        btn_brush_up.clicked = false;
+        if (brush_size < MAX_BRUSH) brush_size++;
+        update_brush_label(); draw_all(); return;
+    }
+    if (dobbtn_OnClick(&btn_brush_dn, x, y))
+    {
+        btn_brush_dn.clicked = false;
+        if (brush_size > 1) brush_size--;
+        update_brush_label(); draw_all(); return;
+    }
+    if (dobbtn_OnClick(&btn_zoom_in, x, y))
+    {
+        btn_zoom_in.clicked = false;
+        if (zoom < MAX_ZOOM) zoom *= 2;
+        update_zoom_label(); draw_all(); return;
+    }
+    if (dobbtn_OnClick(&btn_zoom_out, x, y))
+    {
+        btn_zoom_out.clicked = false;
+        if (zoom > 1) zoom /= 2;
+        update_zoom_label(); draw_all(); return;
+    }
+
+    /* RGB sliders */
+    if (dobsl_OnClick(&sl_r, x, y) || dobsl_OnClick(&sl_g, x, y) || dobsl_OnClick(&sl_b, x, y))
+    {
+        rgb_r = sl_r.value; rgb_g = sl_g.value; rgb_b = sl_b.value;
+        update_color_from_rgb();
+        if (current_color_idx >= PAL_BASE)
+            palette[current_color_idx] = current_color;
+        sync_rgb_controls();
+        draw_all(); return;
+    }
+
+    /* Palette click */
+    if (x < PALETTE_W && y >= TOOLBAR_H + PAL_PAD)
+    {
+        int rel_x = x - PAL_PAD;
+        int rel_y = y - (TOOLBAR_H + PAL_PAD);
+        if (rel_x >= 0 && rel_y >= 0)
+        {
+            int col = rel_x / PAL_CELL;
+            int row = rel_y / PAL_CELL;
+            if (col < PAL_COLS && row < PAL_ROWS)
+            {
+                int idx = row * PAL_COLS + col;
+                if (idx < PAL_TOTAL)
+                {
+                    select_palette_color(idx);
+                    draw_all(); return;
+                }
+            }
+        }
+    }
+
+    /* Canvas click — tool action */
+    int cx, cy;
+    if (screen_to_canvas(x, y, &cx, &cy))
+    {
+        tool_press(cx, cy);
+        draw_all();
+        return;
+    }
+}
+
+void event_mouserelease(int x, int y, uint8_t buttons)
+{
+    (void)buttons;
+
+    for (int i = 0; i < TOOL_COUNT; i++) dobpbtn_OnRelease(&btn_tools[i]);
+    dobbtn_OnRelease(&btn_brush_up); dobbtn_OnRelease(&btn_brush_dn);
+    dobbtn_OnRelease(&btn_zoom_in); dobbtn_OnRelease(&btn_zoom_out);
+
+    /* Slider release — value commits here */
+    bool slider_committed = false;
+    if (sl_r.grabbed || sl_g.grabbed || sl_b.grabbed)
+        slider_committed = true;
+    dobsl_OnRelease(&sl_r); dobsl_OnRelease(&sl_g); dobsl_OnRelease(&sl_b);
+    if (slider_committed)
+    {
+        rgb_r = sl_r.value; rgb_g = sl_g.value; rgb_b = sl_b.value;
+        update_color_from_rgb();
+        if (current_color_idx >= PAL_BASE)
+            palette[current_color_idx] = current_color;
+        sync_rgb_controls();
+        draw_all();
+    }
+
+    /* Shape release */
+    int cx, cy;
+    if (drawing_shape && screen_to_canvas(x, y, &cx, &cy))
+    {
+        tool_release(cx, cy);
+        draw_all();
+    }
+
+    /* End freehand stroke */
+    last_draw_x = -1;
+}
+
+void event_mousemove(int x, int y, uint8_t buttons)
+{
+    (void)buttons;
+
+    /* Slider drag — thumb moves visually, value commits on release */
+    bool slider_moved = false;
+    if (dobsl_OnDrag(&sl_r, x, y) || dobsl_OnDrag(&sl_g, x, y) || dobsl_OnDrag(&sl_b, x, y))
+        slider_moved = true;
+
+    /* Freehand painting on canvas */
+    int cx, cy;
+    if (!slider_moved && (current_tool == TOOL_PENCIL || current_tool == TOOL_ERASER))
+    {
+        if (screen_to_canvas(x, y, &cx, &cy))
+        {
+            uint32_t col = (current_tool == TOOL_ERASER) ? COL_CANVAS_BG : current_color;
+            if (last_draw_x >= 0)
+                paint_line(last_draw_x, last_draw_y, cx, cy, col, brush_size);
+            else
+                paint_dot(cx, cy, col, brush_size);
+            last_draw_x = cx;
+            last_draw_y = cy;
+        }
+    }
+
+    draw_all();
+}
+
+void event_key(uint8_t key)
+{
+    /* Scroll canvas with arrows */
+    int step = 16 / zoom;
+    if (step < 1) step = 1;
+
+    if (key == KEY_UP)    { scroll_y -= step; if (scroll_y < 0) scroll_y = 0; draw_all(); return; }
+    if (key == KEY_DOWN)  { scroll_y += step; draw_all(); return; }
+    if (key == KEY_LEFT)  { scroll_x -= step; if (scroll_x < 0) scroll_x = 0; draw_all(); return; }
+    if (key == KEY_RIGHT) { scroll_x += step; draw_all(); return; }
+
+    /* Brush size shortcuts */
+    if (key == ']' || key == '+') { if (brush_size < MAX_BRUSH) brush_size++; update_brush_label(); draw_all(); return; }
+    if (key == '[' || key == '-') { if (brush_size > 1) brush_size--; update_brush_label(); draw_all(); return; }
+
+    /* Tool shortcuts */
+    if (key == '1') { select_tool(TOOL_PENCIL); draw_all(); return; }
+    if (key == '2') { select_tool(TOOL_ERASER); draw_all(); return; }
+    if (key == '3') { select_tool(TOOL_RECT); draw_all(); return; }
+    if (key == '4') { select_tool(TOOL_CIRCLE); draw_all(); return; }
+
+    /* Reset last draw point on Escape */
+    if (key == 27) { last_draw_x = -1; drawing_shape = false; return; }
+
+    /* RGB textbox input */
+    if (dobtb_OnKey(&tb_r, key) || dobtb_OnKey(&tb_g, key) || dobtb_OnKey(&tb_b, key))
+    {
+        /* Parse values from textboxes on Enter */
+        if (key == '\n')
+        {
+            int v;
+            v = atoi(dobtb_GetText(&tb_r)); if (v < 0) v = 0; if (v > 255) v = 255; rgb_r = v;
+            v = atoi(dobtb_GetText(&tb_g)); if (v < 0) v = 0; if (v > 255) v = 255; rgb_g = v;
+            v = atoi(dobtb_GetText(&tb_b)); if (v < 0) v = 0; if (v > 255) v = 255; rgb_b = v;
+            update_color_from_rgb();
+            if (current_color_idx >= PAL_BASE)
+                palette[current_color_idx] = current_color;
+            sync_rgb_controls();
+        }
+        draw_all(); return;
+    }
+}
+
+void event_scroll(int delta)
+{
+    scroll_y += delta * 8;
+    if (scroll_y < 0) scroll_y = 0;
+    int max_scroll = canvas_h - vp_h / zoom;
+    if (max_scroll < 0) max_scroll = 0;
+    if (scroll_y > max_scroll) scroll_y = max_scroll;
+    draw_all();
+}
+
+void event_panel(int cmd_idx)
+{
+    switch (cmd_idx)
+    {
+        case 0: file_new(); break;
+        case 1: file_open(); break;
+        case 2: file_save(); break;
+        case 3: file_export_bmp(); break;
+    }
+}
+
+void event_resize(int w, int h)
+{
+    win_w = w;
+    win_h = h;
+    update_viewport_rect();
+    lbl_info.y = win_h - 18;
+    dobui_FillRect(win_id, 0, 0, win_w, win_h, COL_BG);
+    draw_all();
+}
+
+void event_start(void)
+{
+    win_id = dobui_window();
+    win_w = dobui_width();
+    win_h = dobui_height();
+    canvas_alloc(DEFAULT_CW, DEFAULT_CH);
+    init_controls();
+
+    /* Check if launched to open a specific file via argv[0] */
+    if (g_openfile && g_openfile[0])
+    {
+        if (import_bmp(g_openfile))
+        {
+            strncpy(current_file, g_openfile, sizeof(current_file) - 1);
+            scroll_x = 0; scroll_y = 0;
+            char buf[32]; snprintf(buf, sizeof(buf), "%dx%d", canvas_w, canvas_h);
+            doblbl_SetText(&lbl_info, buf);
+        }
+    }
+
+    dobui_FillRect(win_id, 0, 0, win_w, win_h, COL_BG);
+    draw_all();
+}
+
+int main(int argc, char **argv)
+{
+    if (argc >= 1 && argv[0] && argv[0][0]) g_openfile = argv[0];
+    dobui_set_panel("Nuovo\nApri\nSalva\nEsporta BMP");
+    dobui_run("DobPicture", WIN_W, WIN_H);
+    return 0;
+}

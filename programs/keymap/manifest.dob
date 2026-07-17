@@ -1,0 +1,4 @@
+name=Tastiera
+mdl=keymap.mdl
+type=program
+autostart=needs:dobinterface

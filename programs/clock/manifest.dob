@@ -1,0 +1,4 @@
+name=Orologio
+mdl=clock.mdl
+type=program
+autostart=needs:dobinterface

@@ -1,0 +1,4 @@
+name=DobFiles
+mdl=DobFiles.mdl
+type=program
+autostart=needs:dobinterface

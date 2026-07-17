@@ -1,0 +1,4 @@
+name=Tonegen
+mdl=tonegen.mdl
+type=program
+driver=true

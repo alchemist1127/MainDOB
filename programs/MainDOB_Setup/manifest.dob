@@ -1,0 +1,5 @@
+name=MainDOB_Setup
+mdl=MainDOB_Setup.mdl
+type=program
+driver=true
+version=0.1.0.0

@@ -1,0 +1,5 @@
+name=DobInstaller
+mdl=DobInstaller.mdl
+type=program
+driver=true
+version=0.1.0.0
