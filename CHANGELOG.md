@@ -1,3 +1,247 @@
+# MainDOB — consegna stratificata eventi-prima: re-kick sul wake ridondante; la cintura declassata a ultima rete (b147)
+
+Obiezione di design accolta: la cintura del sonno e' TIME-driven — non
+e' polling (nessuna scansione di stato, nessun ciclo, nessuna CPU
+accesa: un auto-risveglio da microsecondi ogni 2 s armato dal
+dormiente per se stesso), ma resta un residuo del mondo periodico in
+un sistema che si dichiara a eventi. E il design a blocchi aveva un
+canale event-driven inutilizzato proprio sul punto cieco: il WAKE
+RIDONDANTE.
+
+RADICE STRUTTURALE (gia' notata in b144+, ora riparata): con una IPI
+persa sul ferro, il thread resta READY in coda e la home in hlt — e
+OGNI evento successivo che prova a svegliarlo (ogni pacchetto del
+mouse) usciva dal gate "wake ridondante" di scheduler_unblock senza
+fare NULLA. Il sistema VEDEVA la patologia decine di volte al secondo
+e la ignorava per design.
+
+RIPARO EVENT-DRIVEN (la via primaria, scheduler_unblock): sul ramo
+ridondante — freddo per definizione — se il thread e' READY, ancora
+accodato, e la sua home risulta ADESSO in hlt (la firma esatta della
+consegna mai atterrata), si RITENTA l'IPI. Guarigione alla latenza del
+prossimo evento naturale (millisecondi per l'input), zero periodicita',
+zero costi sul percorso caldo. Letture advisory fuori dai lock: al
+peggio una IPI spuria che il giudice smonta sotto il proprio lock.
+
+LA CINTURA RESTA, declassata a ULTIMA RETE, per il solo caso che
+nessun evento puo' riparare: la conversazione SINCRONA (A chiama B,
+l'IPI verso B si perde, A e' bloccato in attesa della reply — nessuno
+rinvochera' mai un wake su B; sagoma compatibile col freeze originale
+del CQ62). Il limite e' teorico, non implementativo: contro la perdita
+su canale hardware un sistema a soli eventi e' indimostrabile (ARQ /
+due generali — ogni consegna affidabile su canale con perdita esige un
+timeout da qualche parte). Il tempo entra quindi UNA volta, nel punto
+piu' basso e quieto del sistema, e la gerarchia e' dichiarata nel
+codice: eventi prima, tempo come ultima ratio.
+
+File: proc/scheduler.c. [ABI]/[PX] intatti.
+
+---
+
+# MainDOB — cintura del sonno v2: pavimento sul deadline LOCALE (fine dell'"elettrocardiogramma"); direct-map a 768 MB (b146)
+
+DUE difetti della cintura b144+, entrambi DIAGNOSTICATI DAI LOG DI
+CAMPO (QEMU, -smp 2) — e un tetto RAM troppo caro.
+
+1) LA TEMPESTA DI EPISODI (e gli spike a intervalli regolari).
+Sintomo: migliaia di "consegna recuperata" gia' al boot, su QEMU dove
+una IPI non si perde MAI; task manager a elettrocardiogramma.
+RADICE: il verbo della cintura armava min(AGENDA GLOBALE, now+2s).
+Ogni CPU dormiente, a ogni ciclo di sonno, si risincronizzava sulla
+testa dell'agenda di TUTTO il sistema — e diventava co-sparatrice di
+ogni timer altrui sotto i 2 s: typed-text a 33 ms, blink, tick GUI.
+Due CPU sveglie a ogni scadenza, gare di drain, e la firma della gara:
+l'enqueue remoto diventa visibile PRIMA che la sua IPI atterri, il
+fuoco locale arriva in mezzo, il giudice trova lavoro senza impronte
+-> falso positivo dell'audit a raffica. La valanga di kprintf su
+seriale 115200 (~8 ms a riga, attesa TX bounded ma reale) era essa
+stessa il grosso degli spike.
+FIX (event.c): registro per-CPU del deadline ARMATO (s_armed_ns,
+single-writer: refresh e cintura girano sulla CPU che armano). La
+cintura diventa un PAVIMENTO sul SOLO deadline locale: se quello
+armato e' piu' vicino resta sovrano, se la sorgente e' disarmata si
+arma il solo pavimento, e l'agenda globale NON si rilegge — la
+scadenza di un'altra CPU resta responsabilita' di chi l'ha armata,
+esattamente come prima della cintura. Costo a regime: una sveglia da
+microsecondi ogni 2 s per CPU dormiente, e basta.
+Audit ritoccato di conseguenza: la condizione e' dichiarata compatibile
+anche con la gara benigna (finestra di microsecondi, ora rara), log
+"consegna senza impronte" con rate-limit severo (2 iniziali, poi ogni
+1024). Il segnale vero e' un contatore che cresce STABILMENTE a
+sistema quieto, non l'episodio sporadico.
+
+2) "VEDE 256 MB DI RAM".
+Due concause. La VM: QEMU_MEMORY era 256M nel Makefile (ora 1G, che
+esercita anche il tetto). Il kernel: il tetto allocabile min(RAM,
+direct-map) ratificato in b145 e' CORRETTO (mai distribuire frame
+irraggiungibili a KERNEL_VMA+F) ma il direct-map fermo a 256 MB lo
+rendeva sproporzionato: un CQ62 da 2-4 GB troncato a 256 MB.
+FIX: direct-map esteso a 768 MB — tutto il budget VA kernel non
+impegnato. Nuovo layout (paging.c): C000_0000..F000_0000 direct-map;
+F000_0000..FF00_0000 finestra heap (KHEAP_VBASE/VLIMIT ricollocate,
+240 MB di VA); FF00_0000..FF80_0000 transienti (smoke test spostato a
+FF000000); PD_TEMP e recursive intatti. Il pre-allocate delle PT della
+finestra segue il nuovo range (lo snapshot PDE resta immutabile e
+completo). RAM oltre i 768 MB resta dichiaratamente ignorata e
+DENUNCIATA dal log PMM: la via vera e' un highmem con finestre mobili
+— decisione separata, non un rattoppo.
+
+File: time/event.{c,h}, proc/scheduler.c, mm/paging.c, mm/kheap.c,
+mm/pmm.c (commenti), Makefile. [ABI]/[PX] intatti: gli indirizzi
+toccati sono tutti interni al kernel (nessun VA condiviso con
+userspace nel range mosso).
+
+---
+
+# MainDOB — audit dei fix non documentati: regressione mirata (valvola RT, firma "inceppato" + offerte donatore), il resto ratificato (b145)
+
+CONTESTO. Confronto sistematico con l'albero b144 (content_blit
+fastpath): l'albero corrente porta un corpo ampio di modifiche kernel
+SENZA voce di changelog. Difetto di PROCESSO prima che di codice: ogni
+cambio di comportamento va documentato, o diventa impossibile separare
+i fix reattivi (bug osservati) dai preventivi (ipotesi). Questo audit
+li ha ripassati uno a uno, giudicandoli nel merito.
+
+RATIFICATI (restano, con questa voce come documentazione postuma —
+tutti chiudono classi di bug reali o osservate):
+- workqueue sotto spinlock MPMC (irq_save da solo su ring condiviso
+  fra CPU e' rotto su SMP per costruzione);
+- canali NON-PERDIBILI di teardown/respawn (teardown_q intrusiva,
+  respawn_pending) al posto della workqueue droppabile per il lavoro
+  di recupero critico; fault path di isr.c allineato;
+- process_get_ref/process_put + process_reclaim (lookup PID pinnato:
+  chiude la finestra use-after-free del puntatore nudo);
+- copie utente fault-safe via .ex_table (copy_from_user/copy_to_user):
+  chiude il TOCTOU check-poi-unmap di un thread fratello;
+- discovery.c: expires_at in ms a 64 bit (il wrap dei 49,7 giorni);
+- attese temporizzate fail-closed su heap timer saturo (wait, futex):
+  timeout immediato invece del sonno eterno;
+- PMM: tetto allocabile = min(RAM, direct-map) — mai distribuire frame
+  irraggiungibili a KERNEL_VMA+F;
+- buffer IPC per-processo a frame INDIPENDENTI (map_anon_range, con
+  azzeramento anti info-leak e rollback atomico): lo spawn non fallisce
+  piu' con RAM libera ma frammentata;
+- FPU lazy-restore per proprietario (fpu_owner): AUDITATO — il reap
+  invalida l'owner e nel modello a spawn nessun percorso rifonda lo
+  stato FP di un thread vivo in memoria; guadagno netto sul pattern
+  dominante A -> idle -> A;
+- cpu_hungry + donazione solo-compute (lezione b132, osservata);
+- crescita/ritiro dell'heap timer, coalescenza VA del kheap, trim del
+  depot IPC, coordinatore reclaim, dma_pool: l'igiene del "boot
+  eterno" — preventivi di principio, costo a regime nullo;
+- saturazione refcount: resta (protegge dal wrap -> UAF, costo un
+  confronto predetto), MA saturava e assorbiva l'underflow IN
+  SILENZIO, contro la debuggabilita' dichiarata: aggiunte
+  refcount_saturation_note / refcount_underflow_note (fuori-linea in
+  krt/refcount.c, rate-limited) — le patologie restano assorbite, ma
+  ora si VEDONO.
+
+REGREDITI (preventivi netti: costo su percorsi caldi contro rischi
+ipotetici o coperture ridondanti):
+- VALVOLA DI EQUITA' RT (rt_burst_ns, rt_relief, rt_valve_account,
+  ramo nel pick): difendeva da un thread prio-0 in busy-loop MAI
+  osservato; la motivazione "watchdog compresi" non regge — il
+  watchdog kernel uccide via callback timer in contesto IRQ, non
+  dipende dallo scheduling. In cambio caricava il pick (il percorso
+  piu' caldo) e violava in un angolo il contratto di priorita' stretta
+  dichiarato. Un RT rotto si diagnostica e si fixa; non si ammortizza
+  per sempre nel pick di tutti.
+- FIRMA "INCEPPATO" nel pull + OFFERTE DEL DONATORE in slice_check
+  (contended_since_ns, last_offer_ns, isteresi 50 ms, offerte ogni
+  100 ms): reintroduceva l'inseguimento della coda-a-1 che b118 aveva
+  escluso come rumore (sia pure con isteresi) e aggiungeva lavoro a
+  OGNI slice check con potenziale churn di migrazioni/IPI sul
+  dual-core. Il buco che copriva — core sovraccarico DOPO che l'altro
+  s'e' addormentato, nessuna rivalutazione — e' oggi coperto DALLA
+  CINTURA DEL SONNO: al suo fuoco (<= 2 s) la CPU dormiente ripassa da
+  idle_try_pull e vede il sovraccarico profondo. Stessa copertura per
+  un evento raro, zero costo a regime. Il pull torna alla sola firma
+  PROFONDA (>= PULL_MIN_READY).
+
+NOTA di onesta' sul sintomo riportato ("peggiorato per prestazioni e
+affidabilita'"): dei regrediti, solo donor/inceppato poteva incidere
+sulle prestazioni a regime (churn di migrazioni sul carico
+conversazionale reale); la valvola RT era inerte ma caricava il pick.
+NESSUNO dei due spiega il freeze del CQ62 sotto screensaver (con
+l'idle in corso non girano slice check): la diagnosi della cintura del
+sonno (b144+) resta in piedi e la riga di audit in seriale e' la
+verifica sul campo.
+
+File: proc/scheduler.c, krt/refcount.{h,c} (nuovo .c). [ABI]/[PX]
+intatti.
+
+---
+
+# MainDOB — cintura del sonno: risveglio hardware garantito alle CPU in hlt (chiude il buco IPI-persa di b93)
+
+Sintomo sul campo (CQ62, live CD): screensaver attivo da tempo, al
+ritorno schermo nero con la sola freccia (HW cursor statico nei
+registri), nessuna reazione a mouse o tastiera. Niente schermata di
+panic (b113 l'avrebbe dipinta): kernel plausibilmente vivo, consegna
+degli eventi morta.
+
+RADICE (il buco DICHIARATO dalla nota di onesta' di b93 e mai chiuso):
+da b93 non esiste piu' alcuna rete periodica — il protocollo cpu_idle
++ barriere simmetriche e' corretto per costruzione contro ogni gara
+SOFTWARE (ri-verificato riga per riga in questa indagine: regge), ma
+una IPI di resched che il FERRO non consegna lascia il thread READY in
+coda e la home in hlt per sempre. Aggravante strutturale: ogni wake
+successivo dello stesso thread esce al gate "wake ridondante" di
+scheduler_unblock senza mai ritentare l'IPI — una perdita = consegna
+morta definitiva (ogni mossa del mouse sveglia inputd... che e' gia'
+READY in coda: niente nuovo kick). Su QEMU una IPI non si perde mai;
+il CQ62 dual-core e' il primo ferro vero a dormire a lungo (merito
+dello screensaver nuovo) e quindi il primo esposto.
+
+IL MODELLO, sistemico e fedele alla separazione — non un floor
+reintrodotto, non un canale di consegna nuovo:
+- INVARIANTE: nessuna CPU dorme in hlt oltre SLEEP_BELT_NS (2 s) senza
+  un risveglio garantito dal PROPRIO silicio.
+- ESECUTIVO (time/event.c): verbo time_event_arm_sleep_belt(period) —
+  arma la sorgente LOCALE al minimo tra agenda e now+period.
+  IRQ-atomico al proprio interno; nessuna policy. time_event_refresh
+  resta orologio puro, intatto: il primo dispatch dopo il risveglio
+  (switch_to -> refresh) riassorbe la cintura da se'. Sul fallback PIT
+  periodico e' un no-op dichiarato (il tick E' gia' la cintura).
+- LOGICA (scheduler_idle_block, l'unico punto in cui si dorme): arma
+  la cintura come ultima parola prima di sti;hlt, solo SMP (su UP non
+  esistono IPI: ogni enqueue e' locale e l'epilogo IRQ consegna).
+- CONSEGNA: la macchina che gia' esiste. Al fuoco della cintura,
+  event_fire -> preempt_if_needed trova need_resched alzato
+  dall'enqueue orfano e consegna dal giudice, come ogni altro wake.
+
+AUDIT (massima debuggabilita', tre campi per-CPU single-writer):
+wake_ipi_seen (timbrato dal nuovo ingresso scheduler_resched_ipi, che
+incapsula il giudice: arch/lapic resta ignaro dello stato di
+scheduling) e wake_local_seen (timbrato dall'enqueue con home locale)
+sono l'impronta dell'episodio di sonno, azzerati dal blocco idle prima
+di pubblicare cpu_idle. Il giudice, quando strappa la CPU dall'idle
+con lavoro in coda e NESSUNA impronta, ha davanti l'esatta patologia:
+log rate-limited "[SCHD] cintura del sonno: consegna recuperata su cpu
+N (probabile IPI persa sul ferro)" + contatore belt_recoveries. Sul
+CQ62 quella riga in seriale e' la prova sul campo. Advisory puri: mai
+una decisione di scheduling ne dipende.
+
+COSTO a sistema sano: mezzo risveglio al secondo per CPU dormiente, un
+event_fire vuoto (un confronto), zero tocchi sul percorso caldo dei
+wake, zero letture cross-CPU. Latenza massima di recupero da una IPI
+persa: un periodo. SCARTATO il retry dell'IPI in enqueue_home_and_kick
+per thread gia' READY: secondo meccanismo per lo stesso invariante,
+stato in piu' sul percorso caldo — la cintura da sola limita il danno
+e il design resta a un solo proprietario per responsabilita'.
+
+Finestra residua dichiarata (commento nel verbo): un fuoco timer
+interposto tra l'arm della cintura e l'hlt puo' disarmare la sorgente
+(refresh su agenda vuota) e quel singolo sonno parte scoperto —
+microsecondi su una protezione probabilistica, il sonno successivo si
+riallaccia.
+
+File: time/event.{c,h}, proc/scheduler.c. [ABI]/[PX] intatti: nessuna
+syscall, nessun opcode, nessun layout condiviso toccato (i campi nuovi
+sono in coda a sched_cpu_t, struttura senza consumatori ASM).
+
+---
+
 # MainDOB — Logon: password di accesso, screensaver, timeout e Blocca (dobinterface2)
 
 Nuovo foglio logon.c: la "tenda". Se /SYSTEM/CONFIG/Logon_password.dat
